@@ -11,6 +11,37 @@
 
 ## 6.1 四种调用模式概览
 
+### 如何在 .proto 中指定调用模式
+
+调用模式**在 proto 文件中通过 `stream` 关键字定义**，编译后无法在运行时切换。以 `examples/features/proto/echo/echo.proto` 为例：
+
+```protobuf
+service Echo {
+  // Unary: 两端都没有 stream —— 一问一答
+  rpc UnaryEcho(EchoRequest) returns (EchoResponse) {}
+
+  // Server Streaming: 仅响应加 stream —— 一问多答
+  rpc ServerStreamingEcho(EchoRequest) returns (stream EchoResponse) {}
+
+  // Client Streaming: 仅请求加 stream —— 多问一答
+  rpc ClientStreamingEcho(stream EchoRequest) returns (EchoResponse) {}
+
+  // Bidi Streaming: 两端都加 stream —— 自由收发
+  rpc BidirectionalStreamingEcho(stream EchoRequest) returns (stream EchoResponse) {}
+}
+```
+
+### 生成的 Go 接口对照
+
+| 模式 | proto 写法 | 生成的客户端方法签名 |
+|------|-----------|-------------------|
+| Unary | `rpc X(A) returns (B)` | `X(ctx, *A) (*B, error)` |
+| Server Streaming | `rpc X(A) returns (stream B)` | `X(ctx, *A) (pb.XClient, error)` → 循环 Recv |
+| Client Streaming | `rpc X(stream A) returns (B)` | `X(ctx) (pb.XClient, error)` → Send 多次后 CloseAndRecv |
+| Bidi | `rpc X(stream A) returns (stream B)` | `X(ctx) (pb.XClient, error)` → 自由 Send/Recv |
+
+### 四种模式简表
+
 ```
 ┌─────────────────┬──────────────┬──────────────┐
 │      模式        │   客户端      │   服务端      │
@@ -28,6 +59,17 @@
   Bidi Stream:    C ──req1──req2──►     ◄──resp1──resp2── S
                   C ◄──resp1──resp2──   ──req3──req4──► S
 ```
+
+### 四种模式的实际适用场景
+
+| 模式 | 典型场景 | 选择理由 |
+|------|---------|---------|
+| Unary | 查询用户信息、下单、登录 | 最简单，心智负担最低。能用 Unary 就别用流式 |
+| Server Streaming | 导出报表、订阅行情、tail 日志、进度通知 | 服务端数据量大，分批推送。客户端边收边处理，不用等全部到达 |
+| Client Streaming | 大文件上传、批量数据导入、传感器上报 | 客户端数据量大，分批发送。发完后统一得到结果 |
+| Bidi | 聊天、实时协作编辑、游戏同步、音视频通话 | 收发顺序不固定，需要全双工交互 |
+
+**决策口诀**：客户端数据多 → Client Streaming；服务端数据多 → Server Streaming；两边都多/实时 → Bidi；除此之外 → Unary。
 
 ### 在 HTTP/2 层面，四种模式都是 Stream
 

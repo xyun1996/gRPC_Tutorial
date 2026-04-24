@@ -75,6 +75,58 @@ func NewClient(target string, opts ...DialOption) (*ClientConn, error) {
 
 **关键设计**：`NewClient()` 是**惰性的**——它不会立即建立任何网络连接！连接在第一次 RPC 调用时按需建立。
 
+### Channel / SubConn / TCP 的层次关系
+
+很多初学者会以为 Channel 对应一条 TCP 连接，但实际上 gRPC 采用的是三层架构：
+
+```
+ClientConn (Channel — 虚拟连接)
+  ├── SubConn (acBalancerWrapper — LB 的最小单元)
+  │     └── addrConn — "a network connection to a given address"
+  │           └── transport ← 真正的 TCP/HTTP2 连接
+  ├── SubConn
+  │     └── addrConn
+  │           └── transport
+  └── SubConn
+        └── addrConn
+              └── transport
+```
+
+| 层级 | 数量 | 对应关系 |
+|------|------|---------|
+| Channel (ClientConn) | 1 | 一次 `Dial` 创建一个 |
+| SubConn | N | 每个后端实例一个 |
+| TCP 连接 (transport) | N | 每个 SubConn 内部一个 |
+
+**为什么一个 Channel 能有多条 TCP 连接？**
+
+考虑这个场景：
+```
+你的服务 example-svc 部署了 3 个 Pod:
+  10.0.1.1:50051
+  10.0.1.2:50051
+  10.0.1.3:50051
+```
+
+当 `grpc.Dial("example-svc:50051")` 时：
+1. **Resolver** 把服务名解析为 3 个地址
+2. **Balancer** 为每个地址创建一个 SubConn → addrConn → 各自建立一条 TCP 连接
+3. 每次 RPC 时，**Picker** 从 3 个 Ready 的 SubConn 中选一个发请求
+
+这就是客户端负载均衡的核心机制。Channel 其实更像一个**连接池管理器**。
+
+**SubConn 的精确定义**
+
+```go
+// balancer/balancer.go:140
+// ClientConn.NewSubConn is called by balancer to create a new SubConn.
+
+// balancer/balancer.go:280
+// SubConn is the connection to use for this pick, if its state is Ready.
+```
+
+SubConn 是 Load Balancer 创建的子连接，包裹 `addrConn`。它是负载均衡的**最小单元**——每个 SubConn 对应一个后端地址，维护一条 transport（TCP 连接），并拥有独立的连接状态。
+
 ### 连接状态机
 
 `connectivity/connectivity.go` 定义了五个状态：
@@ -175,6 +227,61 @@ manual             manual:///    手动控制（测试用）
 unix               unix:///      Unix 域套接字
 xDS                xds:///       xDS 动态发现
 ```
+
+### DNS 服务器选择机制
+
+gRPC 的 DNS 解析器**不自建 DNS 协议**，而是委托给 Go 标准库的 `net.Resolver`。DNS 服务器的选择取决于拨号目标中是否指定了 **authority**。
+
+**关键入口** (`dns_resolver.go:147`):
+
+```go
+d.resolver, err = internal.NewNetResolver(target.URL.Host)
+//                                       ↑ authority 来自 URI 的 host 部分
+```
+
+**分支逻辑** (`dns_resolver.go:92`):
+
+```go
+var newNetResolver = func(authority string) (internal.NetResolver, error) {
+    if authority == "" {
+        return net.DefaultResolver, nil   // 分支 A: 系统默认 DNS
+    }
+
+    host, port, _ := parseTarget(authority, "53")
+    authorityWithPort := net.JoinHostPort(host, port)
+
+    return &net.Resolver{
+        PreferGo: true,                                      // 分支 B: Go 纯客户端
+        Dial:     internal.AddressDialer(authorityWithPort), // 指定 DNS 服务器
+    }, nil
+}
+```
+
+**场景 A — 不指定 authority（绝大多数情况）**
+
+```
+grpc.Dial("example.com:50051")
+```
+→ `target.URL.Host` 为空 → 使用 `net.DefaultResolver`
+
+DNS 服务器由操作系统决定：
+- Linux：`/etc/resolv.conf` 中的 `nameserver`
+- Windows：网络适配器的 DNS 设置
+- Go 的 `DefaultResolver` 优先级：CGO enabled 时走 libc getaddrinfo()，CGO disabled 时走纯 Go DNS 客户端直接读 `/etc/resolv.conf`
+
+**场景 B — 指定 authority（自定义 DNS 服务器）**
+
+```
+grpc.Dial("dns://8.8.8.8/example.com:50051")
+grpc.Dial("dns://dns.local:5353/example.com:50051")
+```
+→ `target.URL.Host` = `"8.8.8.8"` → 创建自定义 `net.Resolver`，`PreferGo: true`，直接向指定地址发起 DNS 查询
+
+| 拨号方式 | DNS 服务器 | 解析器 |
+|---------|-----------|--------|
+| `example.com:50051` | OS 默认（/etc/resolv.conf） | `net.DefaultResolver` |
+| `dns://8.8.8.8/example.com:50051` | `8.8.8.8:53` | 自定义 `net.Resolver` |
+| `dns://ns1.local:5353/example.com:50051` | `ns1.local:5353` | 自定义 `net.Resolver` |
 
 ### Resolver → ClientConn 的桥接
 

@@ -360,6 +360,126 @@ streamDone:      两端都完成
 
 ---
 
+## 3.4-S 客户端 Stream ID 分配机制
+
+### 初始值和递增规则
+
+HTTP/2 规范（RFC 7540, Section 5.1.1）规定：**客户端发起的流必须用奇数 ID，服务端发起的用偶数 ID**。gRPC-Go 严格遵循：
+
+```go
+// http2_client.go:357 — 客户端 nextID 初始值为 1
+nextID: 1,
+
+// http2_client.go:857-858 — 每次创建新流时
+hdr.streamID = t.nextID   // 使用当前值：1, 3, 5, 7...
+t.nextID += 2             // 递增 2，保持奇数
+```
+
+所以客户端发出的 stream ID 序列是：**1 → 3 → 5 → 7 → 9 → ...**
+
+### 为什么是奇数？
+
+收到一个 HEADERS 帧时，只需看 stream ID 的奇偶性就能判断来源，无需额外标识。服务端也做了对应校验：
+
+```go
+// http2_server.go:395
+if streamID%2 != 1 || streamID <= t.maxStreamID {
+    // illegal gRPC stream id.
+}
+```
+
+---
+
+## 3.4-T HTTP/2 连接建立的源码全流程
+
+### 调用链
+
+```
+addrConn.resetTransportAndUnlock()        // clientconn.go:1326
+  └─ ac.tryAllAddrs()                     // clientconn.go:1452
+       └─ ac.createTransport()            // clientconn.go:1490
+            └─ transport.NewHTTP2Client() // http2_client.go:210
+```
+
+### NewHTTP2Client 内部步骤
+
+| 步骤 | 源码位置 | 作用 |
+|------|---------|------|
+| TCP 拨号 | `http2_client.go:225` `dial()` | 建立 TCP 连接（支持自定义 Dialer、代理） |
+| TLS 握手 | `http2_client.go:295` `ClientHandshake()` | TLS 1.3/1.2 握手（如有 transport creds） |
+| 写前言 | `http2_client.go:431` | 发送 `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` |
+| 写 SETTINGS | `http2_client.go:454` | 发送初始 SETTINGS（窗口大小等） |
+| 可能 WINDOW_UPDATE | `http2_client.go:460` | 如果自定义了连接窗口大小 |
+| 启动 reader | `http2_client.go:420` `go t.reader()` | 后台读帧协程 |
+| 等待握手完成 | `http2_client.go:473` `<-readerErrCh` | 阻塞直到收到服务端 SETTINGS |
+| 启动 loopy writer | `http2_client.go:477` `go t.loopy.run()` | 后台写帧协程 |
+
+### reader 协程的工作
+
+```go
+// http2_client.go:1655
+func (t *http2Client) reader(errCh chan<- error) {
+    // 1. 读取服务端 SETTINGS 帧（连接握手）
+    t.readServerPreface()          // → errCh <- nil 表示握手成功
+
+    // 2. 进入读循环
+    for {
+        frame := t.framer.readFrame()
+        // 根据帧类型分发处理:
+        //   DATA        → 写入对应 stream 的接收缓冲区
+        //   HEADERS     → 处理响应头或 trailers
+        //   SETTINGS    → 更新连接参数
+        //   PING        → 回复 ACK
+        //   GOAWAY      → 触发优雅关闭
+        //   RST_STREAM  → 终止对应 stream
+    }
+}
+```
+
+### 时序图
+
+```
+Client                              Server
+  │──── TCP SYN ────────────────────→  │
+  │←─── TCP SYN+ACK ────────────────  │
+  │──── TCP ACK ───────────────────→  │   ← dial()
+  │                                    │
+  │──── TLS ClientHello ────────────→  │
+  │←─── TLS ServerHello + Cert ─────  │
+  │──── TLS Finished ───────────────→  │   ← ClientHandshake()
+  │←─── TLS Finished ───────────────  │
+  │                                    │
+  │──── PRI * HTTP/2.0\r\n\r\n ──────→  │   ← 客户端前言
+  │──── SETTINGS[...] ──────────────→  │   ← 客户端参数
+  │                                    │
+  go reader()                          │   ← 启动读协程
+  │                                    │
+  │←─── SETTINGS[...] ──────────────  │   ← 服务端前言+参数
+  │                                    │
+  │──── SETTINGS ACK ───────────────→  │   ← loopy writer 自动回复
+  │←─── SETTINGS ACK ───────────────  │
+  │                                    │
+  go loopy.run()                       │   ← 启动写协程
+  │                                    │
+  │======== HTTP/2 连接就绪 ==========│
+```
+
+### 关键源码位置速查
+
+| 文件 | 函数 | 职责 |
+|------|------|------|
+| `clientconn.go:1326` | `resetTransportAndUnlock` | 触发连接 |
+| `clientconn.go:1452` | `tryAllAddrs` | 逐个地址尝试 |
+| `clientconn.go:1490` | `createTransport` | 创建单个传输 |
+| `http2_client.go:161` | `dial()` | TCP 拨号 |
+| `http2_client.go:295` | `ClientHandshake()` | TLS 握手 |
+| `http2_client.go:431` | Write clientPreface | 写 HTTP/2 前言 |
+| `http2_client.go:1639` | `readServerPreface` | 读服务端 SETTINGS |
+| `http2_client.go:1655` | `reader()` | 读帧循环 |
+| `http2_client.go:477` | `loopy.run()` | 写帧循环 |
+
+---
+
 ## 3.5 动手实验
 
 ### 实验1：用 Go 直接发送 HTTP/2 帧模拟 gRPC 请求

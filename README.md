@@ -111,4 +111,13 @@
 | **动手实践** | 每课配有实验，从抓包观察逐步到实现自定义组件 |
 | **闭环理解** | 第1课的全景图在后续9课中逐层展开，第10课回归全局架构 |
 
+## 附录
+
+| 附录 | 主题 | 文件 |
+|------|------|------|
+| 附录A | Stats Handler — 可观测性接口 | [appendix-a-stats-handler.md](appendix-a-stats-handler.md) |
+| 附录B | 关于废弃代码的 FAQ | [appendix-b-deprecated-faq.md](appendix-b-deprecated-faq.md) |
+
+---
+
 建议学习节奏：每课 1-2 周，配合 grpc-go 源码阅读，总计约 3-4 个月完成。
